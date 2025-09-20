@@ -254,17 +254,39 @@ fi
 
 ok "TCP 优化配置已成功应用！"
 echo
-echo "==== RESULT ===="
-echo "最终使用值 -> 内存: ${MEM_G} GiB, 带宽: ${BW_Mbps} Mbps, RTT: ${RTT_ms} ms"
-echo "计算出的缓冲区桶值: ${MAX_MB} MB"
-echo "----------------"
-sysctl -n net.ipv4.tcp_congestion_control
-sysctl -n net.core.default_qdisc
-sysctl -n net.core.rmem_max
-sysctl -n net.core.wmem_max
-sysctl -n net.ipv4.tcp_rmem
-sysctl -n net.ipv4.tcp_wmem
+echo "==== [ TuneTCP 优化结果 ] ===="
+echo
+
+# 计算BDP（MB）以便显示
+BDP_MB=$(awk -v b="$BDP_BYTES" 'BEGIN{ printf "%.2f", b/1024/1024 }')
+
+# 定义一些颜色
+GREEN="\033[1;32m"
+RESET="\033[0m"
+
+# I. 核心参数摘要
+echo -e "${GREEN}[+] I. 核心参数摘要${RESET}"
+printf "    - %-12s : %s\n" "输入内存" "${MEM_G} GiB"
+printf "    - %-12s : %s\n" "输入带宽" "${BW_Mbps} Mbps"
+printf "    - %-12s : %s\n" "输入延迟" "${RTT_ms} ms"
+printf "    - %-12s : %s\n" "计算BDP" "${BDP_MB} MB"
+printf "    - %-12s : %s\n" "最终缓冲区" "${MAX_MB} MB"
+echo
+
+# II. 内核参数验证
+echo -e "${GREEN}[+] II. 内核参数验证${RESET}"
+printf "    - %-25s : %s\n" "TCP 拥塞控制" "$(sysctl -n net.ipv4.tcp_congestion_control)"
+printf "    - %-25s : %s\n" "默认包调度器" "$(sysctl -n net.core.default_qdisc)"
+printf "    - %-25s : %s (%s MB)\n" "最大接收缓冲区" "$(sysctl -n net.core.rmem_max)" "$MAX_MB"
+printf "    - %-25s : %s (%s MB)\n" "最大发送缓冲区" "$(sysctl -n net.core.wmem_max)" "$MAX_MB"
+printf "    - %-25s : %s\n" "TCP 接收缓冲区 (min/def/max)" "$(sysctl -n net.ipv4.tcp_rmem)"
+printf "    - %-25s : %s\n" "TCP 发送缓冲区 (min/def/max)" "$(sysctl -n net.ipv4.tcp_wmem)"
+echo
+
+# III. 网络接口验证
 if command -v tc >/dev/null 2>&1 && [ -n "${IFACE:-}" ]; then
-  echo "qdisc on ${IFACE}:"; tc qdisc show dev "$IFACE" || true
+    echo -e "${GREEN}[+] III. 网络接口验证${RESET}"
+    printf "    - 接口 %-10s : %s\n" "${IFACE} 队列" "$(tc qdisc show dev "$IFACE" | head -1)"
 fi
-echo "==============="
+
+echo "=================================="
