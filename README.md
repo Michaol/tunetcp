@@ -1,6 +1,6 @@
 [![许可证: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0) ![Badge](https://hitscounter.dev/api/hit?url=https%3A%2F%2Fgithub.com%2FMichaol%2tunetcp&label=&icon=github&color=%23198754&message=&style=flat&tz=Asia%2FShanghai)
 
-TuneTCP
+##TuneTCP，根据GPTADM在NodeSeek发布的源码修改而来的TCP优化脚本
 
 一个为 Linux 服务器设计的智能、交互式 TCP 网络性能优化脚本，旨在自动化启用 BBRv1 拥塞控制算法和 FQ (Fair Queue) 包调度器，并根据实际环境科学地配置 TCP 缓冲区，从而充分利用服务器带宽，改善网络传输效率。
 
