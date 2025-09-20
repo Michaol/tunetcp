@@ -60,7 +60,6 @@ get_rtt_ms() {
 # --- 新增: 兼容BusyBox的sysctl应用函数 ---
 apply_sysctl_settings() {
     note "正在应用 sysctl 配置 (BusyBox 兼容模式)..."
-    # sysctl --system 在标准Linux上扫描的目录列表
     dirs="/run/sysctl.d /etc/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d"
     files_to_load=""
     
@@ -74,13 +73,11 @@ apply_sysctl_settings() {
         fi
     done
     
-    # 最后加上主配置文件
     if [ -f "/etc/sysctl.conf" ]; then
         files_to_load="$files_to_load /etc/sysctl.conf"
     fi
     
     if [ -n "$files_to_load" ]; then
-        # -e 选项可以忽略未知键值的错误，行为更接近 --system
         sysctl -e -p $files_to_load >/dev/null
     else
         ok "未找到 sysctl 配置文件。" >&2
