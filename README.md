@@ -23,7 +23,7 @@ Debian/Ubuntu/CentOS/Fedora 请以 root 用户身份登录您的 Linux 服务器
 wget -qO tunetcp.sh https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh && chmod +x tunetcp.sh && ./tunetcp.sh
 ```
 
-Alpine用户请使用tunetcp-a.sh，此脚本POSIX化修改，理论上通用兼容，但是我没有测试环境，有问题请反馈：
+Alpine用户请使用tunetcp-a.sh，此脚本POSIX化修改，理论上通用兼容Alpine/Debian/Ubuntu/CentOS/Fedora，Ubuntu测试通过，但是我没有其他系统测试环境，有问题请反馈：
 ```
 wget -qO tunetcp-a.sh https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp-a.sh && chmod +x tunetcp-a.sh && sh ./tunetcp-a.sh
 ```
