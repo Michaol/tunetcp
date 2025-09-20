@@ -1,8 +1,6 @@
 [![许可证: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0) ![Badge](https://hitscounter.dev/api/hit?url=https%3A%2F%2Fgithub.com%2FMichaol%2tunetcp&label=&icon=github&color=%23198754&message=&style=flat&tz=Asia%2FShanghai)
 
-================
 TuneTCP
-================
 
 一个为 Linux 服务器设计的智能、交互式 TCP 网络性能优化脚本，旨在自动化启用 BBRv1 拥塞控制算法和 FQ (Fair Queue) 包调度器，并根据实际环境科学地配置 TCP 缓冲区，从而充分利用服务器带宽，改善网络传输效率。
 
@@ -21,11 +19,13 @@ TuneTCP
 
 请以 root 用户身份登录您的 Linux 服务器，然后执行以下任一命令：
 
-使用 cURL:
+```使用 cURL:
 bash <(curl -sS https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh)
+```
 
-使用 Wget:
+```使用 Wget:
 bash <(wget -qO- https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh)
+```
 
 脚本工作流程
 
