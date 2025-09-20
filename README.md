@@ -17,10 +17,10 @@ TuneTCP
 
 一键运行
 
-请以 root 用户身份登录您的 Linux 服务器，然后执行以下任一命令：
+请以 root 用户身份登录您的 Linux 服务器，然后执行以下命令：
 
 ```使用 Wget:
-wget -qO- https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh | bash
+wget -qO tunetcp.sh https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh && chmod +x tunetcp.sh && ./tunetcp.sh
 ```
 
 脚本工作流程
