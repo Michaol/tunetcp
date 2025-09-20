@@ -5,10 +5,10 @@ set -eu
 # TuneTCP (兼容 Alpine Linux 的 POSIX-compliant 版本)
 # - Shell改为/bin/sh, 兼容BusyBox ash
 # - 移除了所有bash特有的语法 (read -p, [[ ]], =~, shopt)
-# - 使用更通用的命令获取系统信息 (awk from /proc, ip addr)
+# - 新增: 使用自定义函数兼容BusyBox的sysctl命令
 # =========================================================
 
-# --- 辅助函数 (使用 printf, 兼容 ash) ---
+# --- 辅助函数 (输出重定向到 stderr, 避免污染返回值) ---
 note() { printf '\033[1;34m[i]\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m[OK]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
@@ -16,7 +16,6 @@ bad()  { printf '\033[1;31m[!!]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- 自动检测函数 (兼容 Alpine) ---
 get_mem_gib() {
-  # 直接从 /proc/meminfo 读取，比 `free` 命令更具可移植性
   mem_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
   awk -v kib="$mem_kib" 'BEGIN {printf "%.2f", kib / 1024 / 1024}'
 }
@@ -25,14 +24,12 @@ get_rtt_ms() {
   ping_target=""
   ping_desc=""
 
-  # POSIX-compliant 变量检查
   if [ -n "${SSH_CONNECTION-}" ]; then
     ping_target=$(echo "$SSH_CONNECTION" | awk '{print $1}')
     ping_desc="SSH 客户端 ${ping_target}"
     note "成功从 SSH 连接中自动检测到客户端 IP: ${ping_target}"
   else
     note "未检测到 SSH 连接环境，需要您提供一个客户机IP。"
-    # POSIX-compliant 方式实现 read -p
     printf "请输入一个代表性客户机IP进行ping测试 (直接回车则ping 1.1.1.1): "
     read -r client_ip
     if [ -n "$client_ip" ]; then
@@ -50,17 +47,46 @@ get_rtt_ms() {
   note "正在通过 ping ${ping_desc} 测试网络延迟..."
   ping_result=$(ping -c 4 -W 2 "$ping_target" 2>/dev/null | tail -1 | awk -F'/' '{print $5}')
   
-  # POSIX-compliant 数字校验 (使用 awk 代替 =~ )
   is_ping_num=$(echo "$ping_result" | awk '/^[0-9]+([.][0-9]+)?$/ {print 1}')
   if [ "$is_ping_num" = "1" ]; then
     ok "检测到平均 RTT: ${ping_result} ms"
-    # 使用 awk 进行取整，比 bash 的 printf 更可靠
     echo "$ping_result" | awk '{printf "%.0f\n", $1}'
   else
     warn "Ping ${ping_target} 失败，无法检测 RTT。将使用默认值 150 ms。"
     echo "150"
   fi
 }
+
+# --- 新增: 兼容BusyBox的sysctl应用函数 ---
+apply_sysctl_settings() {
+    note "正在应用 sysctl 配置 (BusyBox 兼容模式)..."
+    # sysctl --system 在标准Linux上扫描的目录列表
+    dirs="/run/sysctl.d /etc/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d"
+    files_to_load=""
+    
+    for dir in $dirs; do
+        if [ -d "$dir" ]; then
+            for conf_file in "$dir"/*.conf; do
+                if [ -e "$conf_file" ] || [ -L "$conf_file" ]; then
+                    files_to_load="$files_to_load $conf_file"
+                fi
+            done
+        fi
+    done
+    
+    # 最后加上主配置文件
+    if [ -f "/etc/sysctl.conf" ]; then
+        files_to_load="$files_to_load /etc/sysctl.conf"
+    fi
+    
+    if [ -n "$files_to_load" ]; then
+        # -e 选项可以忽略未知键值的错误，行为更接近 --system
+        sysctl -e -p $files_to_load >/dev/null
+    else
+        ok "未找到 sysctl 配置文件。" >&2
+    fi
+}
+
 
 # --- 主要变量初始化 ---
 MEM_G=$(get_mem_gib)
@@ -69,7 +95,6 @@ BW_Mbps=1000 # 带宽默认值
 
 # --- 交互式确认与修改循环 ---
 while true; do
-    # BusyBox `clear` 可能不存在于超精简环境，但通常有
     command -v clear >/dev/null && clear
     note "请检查并确认以下网络优化参数："
     printf %s\\n "--------------------------------------------------"
@@ -111,15 +136,10 @@ while true; do
     esac
 done
 
+
 # --- 后续流程 ---
-is_num() {
-    # POSIX-compliant 数字校验
-    echo "$1" | awk '/^[0-9]+([.][0-9]+)?$/ {print 1}'
-}
-is_int() {
-    # POSIX-compliant 整数校验
-    echo "$1" | awk '/^[0-9]+$/ {print 1}'
-}
+is_num() { echo "$1" | awk '/^[0-9]+([.][0-9]+)?$/ {print 1}'; }
+is_int() { echo "$1" | awk '/^[0-9]+$/ {print 1}'; }
 if [ ! "$(is_num "$MEM_G")" = "1" ] || [ ! "$(is_int "$BW_Mbps")" = "1" ] || [ ! "$(is_num "$RTT_ms")" = "1" ]; then
     bad "参数包含无效的非数字输入，脚本终止。"
 fi
@@ -140,7 +160,6 @@ MAX_NUM_BYTES=$(awk -v a="$TWO_BDP" -v b="$RAM3_BYTES" -v c="$CAP64" 'BEGIN{ m=a
 
 bucket_le_mb() {
   mb="${1:-0}"
-  # POSIX sh 不支持 [[ ... ]]
   if [ "$mb" -ge 64 ]; then echo 64
   elif [ "$mb" -ge 32 ]; then echo 32
   elif [ "$mb" -ge 16 ]; then echo 16
@@ -174,8 +193,12 @@ comment_conflicts_in_sysctl_conf() {
     cp -a "$f" "$backup_file"
     
     note "注释 /etc/sysctl.conf 中的冲突键"
-    # 使用 sed 代替 awk，在 BusyBox 上可能更可靠
-    sed -i -E "s/($KEY_REGEX)/# \1/" "$f"
+    sed_script=""
+    for key in $(echo "$KEY_REGEX" | tr '|' ' '); do
+        sed_script="${sed_script}s/^[[:space:]]*${key}/# &/;"
+    done
+    # Busybox sed's -i needs a suffix on some versions, safer to use tmp file
+    sed "$sed_script" "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
     ok "已注释掉冲突键"
   else
     ok "/etc/sysctl.conf 无冲突键"
@@ -187,11 +210,8 @@ delete_conflict_files_in_dir() {
   [ -d "$dir" ] || { ok "$dir 不存在"; return 0; }
   moved=0
   backup_suffix=".bak.$(date +%Y%m%d-%H%M%S)"
-  # POSIX-compliant 替代 shopt -s nullglob
   for f in "$dir"/*.conf; do
-    # 检查文件是否存在，以避免在没有匹配项时处理字面上的 "*.conf"
     [ -e "$f" ] || [ -L "$f" ] || continue
-    
     [ "$(readlink -f "$f")" = "$(readlink -f "$SYSCTL_TARGET")" ] && continue
     if grep -E "$KEY_REGEX" "$f" >/dev/null; then
       backup_file="${f}${backup_suffix}"
@@ -222,7 +242,6 @@ note "步骤B：备份并移除 /etc/sysctl.d 下含冲突键的旧文件"
 delete_conflict_files_in_dir "/etc/sysctl.d"
 
 note "步骤C：扫描其他目录（只读提示，不改）"
-# /usr/bin/true in sh
 true
 scan_conflicts_ro "/usr/local/lib/sysctl.d"
 scan_conflicts_ro "/usr/lib/sysctl.d"
@@ -235,7 +254,6 @@ if command -v modprobe >/dev/null 2>&1; then modprobe tcp_bbr 2>/dev/null || tru
 # ---- 写入并应用 ----
 tmpf="$(mktemp)"
 BDP_MB_display=$(awk -v b="$BDP_BYTES" 'BEGIN{ printf "%.2f", b/1024/1024 }')
-# 使用 printf 代替 cat <<EOF, 在某些 sh 实现中更可靠
 printf '# Auto-generated by TuneTCP (https://github.com/Michaol/tunetcp)\n' > "$tmpf"
 printf '# Inputs: MEM_G=%sGiB, BW=%sMbps, RTT=%sms\n' "$MEM_G" "$BW_Mbps" "$RTT_ms" >> "$tmpf"
 printf '# BDP: %s bytes (~%s MB)\n' "$BDP_BYTES" "$BDP_MB_display" >> "$tmpf"
@@ -258,8 +276,8 @@ printf 'net.ipv4.tcp_fastopen = 3\n' >> "$tmpf"
 install -m 0644 "$tmpf" "$SYSCTL_TARGET"
 rm -f "$tmpf"
 
-note "正在应用 sysctl 配置..."
-sysctl --system >/dev/null
+# 修改: 调用新的兼容性函数
+apply_sysctl_settings
 
 IFACE="$(default_iface)"
 if command -v tc >/dev/null 2>&1 && [ -n "${IFACE-}" ]; then
@@ -273,14 +291,10 @@ echo
 echo "==== [ TuneTCP 优化结果 ] ===="
 echo
 
-# 计算BDP（MB）以便显示
 BDP_MB=$(awk -v b="$BDP_BYTES" 'BEGIN{ printf "%.2f", b/1024/1024 }')
-
-# 定义一些颜色
 GREEN="\033[1;32m"
 RESET="\033[0m"
 
-# I. 核心参数摘要
 printf '%b[+] I. 核心参数摘要%b\n' "$GREEN" "$RESET"
 printf "    - %-12s : %s\n" "输入内存" "${MEM_G} GiB"
 printf "    - %-12s : %s\n" "输入带宽" "${BW_Mbps} Mbps"
@@ -289,7 +303,6 @@ printf "    - %-12s : %s\n" "计算BDP" "${BDP_MB} MB"
 printf "    - %-12s : %s\n" "最终缓冲区" "${MAX_MB} MB"
 echo
 
-# II. 内核参数验证
 printf '%b[+] II. 内核参数验证%b\n' "$GREEN" "$RESET"
 printf "    - %-25s : %s\n" "TCP 拥塞控制" "$(sysctl -n net.ipv4.tcp_congestion_control)"
 printf "    - %-25s : %s\n" "默认包调度器" "$(sysctl -n net.core.default_qdisc)"
@@ -299,10 +312,11 @@ printf "    - %-25s : %s\n" "TCP 接收缓冲区 (min/def/max)" "$(sysctl -n net
 printf "    - %-25s : %s\n" "TCP 发送缓冲区 (min/def/max)" "$(sysctl -n net.ipv4.tcp_wmem)"
 echo
 
-# III. 网络接口验证
 if command -v tc >/dev/null 2>&1 && [ -n "${IFACE-}" ]; then
     printf '%b[+] III. 网络接口验证%b\n' "$GREEN" "$RESET"
     printf "    - 接口 %-10s : %s\n" "${IFACE} 队列" "$(tc qdisc show dev "$IFACE" | head -1)"
 fi
 
 echo "=================================="
+echo
+note "复核步骤在 BusyBox 环境下已简化，以上参数即为最终生效值。"
