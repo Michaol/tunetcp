@@ -20,11 +20,11 @@ TuneTCP
 请以 root 用户身份登录您的 Linux 服务器，然后执行以下任一命令：
 
 ```使用 cURL:
-bash <(curl -sS https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh)
+curl -sSL https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh | bash
 ```
 
 ```使用 Wget:
-bash <(wget -qO- https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh)
+wget -qO- https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh | bash
 ```
 
 脚本工作流程
