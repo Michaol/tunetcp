@@ -142,7 +142,7 @@ if [ ! "$(is_num "$MEM_G")" = "1" ] || [ ! "$(is_int "$BW_Mbps")" = "1" ] || [ !
 fi
 
 SYSCTL_TARGET="/etc/sysctl.d/999-net-bbr-fq.conf"
-KEY_REGEX='^net\.core\.default_qdisc|^net\.core\.rmem_max|^net\.core\.wmem_max|^net\.core\.rmem_default|^net\.core\.wmem_default|^net\.ipv4\.tcp_rmem|^net\.ipv4\.tcp_wmem|^net\.ipv4\.tcp_congestion_control'
+KEY_REGEX='^net\.core\.default_qdisc|^net\.core\.rmem_max|^net\.core\.wmem_max|^net\.core\.rmem_default|^net\.core\.wmem_default|^net\.ipv4\.tcp_rmem|^net\.ipv4\.tcp_wmem|^net\.ipv4\.tcp_congestion_control|^net\.ipv4\.tcp_slow_start_after_idle|^net\.ipv4\.tcp_notsent_lowat|^net\.core\.somaxconn|^net\.ipv4\.tcp_max_syn_backlog|^net\.core\.netdev_max_backlog|^net\.ipv4\.ip_local_port_range|^net\.ipv4\.udp_rmem_min|^net\.ipv4\.udp_wmem_min|^net\.core\.optmem_max'
 
 require_root() { if [ "$(id -u)" -ne 0 ]; then bad "请以 root 运行"; fi; }
 default_iface(){ ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -1 || true; }
@@ -192,7 +192,9 @@ comment_conflicts_in_sysctl_conf() {
     note "注释 /etc/sysctl.conf 中的冲突键"
     sed_script=""
     for key in $(echo "$KEY_REGEX" | tr '|' ' '); do
-        sed_script="${sed_script}s/^[[:space:]]*${key}/# &/;"
+        # Strip leading ^ from key for sed pattern to avoid matching literal ^
+        clean_key="${key#^}"
+        sed_script="${sed_script}s/^[[:space:]]*${clean_key}/# &/;"
     done
     # Busybox sed's -i needs a suffix on some versions, safer to use tmp file
     sed "$sed_script" "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
@@ -268,6 +270,15 @@ printf 'net.ipv4.tcp_rmem = %s %s %s\n' "$TCP_RMEM_MIN" "$TCP_RMEM_DEF" "$TCP_RM
 printf 'net.ipv4.tcp_wmem = %s %s %s\n' "$TCP_WMEM_MIN" "$TCP_WMEM_DEF" "$TCP_WMEM_MAX" >> "$tmpf"
 printf '\n' >> "$tmpf"
 printf 'net.ipv4.tcp_mtu_probing = 1\n' >> "$tmpf"
+printf 'net.ipv4.tcp_slow_start_after_idle = 0\n' >> "$tmpf"
+printf 'net.ipv4.tcp_notsent_lowat = 16384\n' >> "$tmpf"
+printf 'net.core.somaxconn = 8192\n' >> "$tmpf"
+printf 'net.ipv4.tcp_max_syn_backlog = 8192\n' >> "$tmpf"
+printf 'net.core.netdev_max_backlog = 16384\n' >> "$tmpf"
+printf 'net.ipv4.ip_local_port_range = 1024 65535\n' >> "$tmpf"
+printf 'net.ipv4.udp_rmem_min = 8192\n' >> "$tmpf"
+printf 'net.ipv4.udp_wmem_min = 8192\n' >> "$tmpf"
+printf 'net.core.optmem_max = 65536\n' >> "$tmpf"
 printf 'net.ipv4.tcp_fastopen = 3\n' >> "$tmpf"
 
 install -m 0644 "$tmpf" "$SYSCTL_TARGET"
@@ -307,6 +318,14 @@ printf "    - %-25s : %s (%s MB)\n" "最大接收缓冲区" "$(sysctl -n net.cor
 printf "    - %-25s : %s (%s MB)\n" "最大发送缓冲区" "$(sysctl -n net.core.wmem_max)" "$MAX_MB"
 printf "    - %-25s : %s\n" "TCP 接收缓冲区 (min/def/max)" "$(sysctl -n net.ipv4.tcp_rmem)"
 printf "    - %-25s : %s\n" "TCP 发送缓冲区 (min/def/max)" "$(sysctl -n net.ipv4.tcp_wmem)"
+printf "    - %-25s : %s\n" "TCP 慢启动闲置重置" "$(sysctl -n net.ipv4.tcp_slow_start_after_idle)"
+printf "    - %-25s : %s\n" "TCP 未发送低水位" "$(sysctl -n net.ipv4.tcp_notsent_lowat)"
+printf "    - %-25s : %s\n" "最大连接监听队列" "$(sysctl -n net.core.somaxconn)"
+printf "    - %-25s : %s\n" "最大 SYN 积压队列" "$(sysctl -n net.ipv4.tcp_max_syn_backlog)"
+printf "    - %-25s : %s\n" "网卡最大接收积压" "$(sysctl -n net.core.netdev_max_backlog)"
+printf "    - %-25s : %s\n" "本地端口范围" "$(sysctl -n net.ipv4.ip_local_port_range)"
+printf "    - %-25s : %s\n" "UDP 最小接收缓冲" "$(sysctl -n net.ipv4.udp_rmem_min)"
+printf "    - %-25s : %s\n" "UDP 最小发送缓冲" "$(sysctl -n net.ipv4.udp_wmem_min)"
 echo
 
 if command -v tc >/dev/null 2>&1 && [ -n "${IFACE-}" ]; then
