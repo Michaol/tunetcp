@@ -100,7 +100,7 @@ while true; do
     printf "3. 网络延迟(RTT): %s ms (根据客户端自动检测)\n" "$RTT_ms"
     printf %s\\n "--------------------------------------------------"
     printf "直接按 [Enter] 应用设置, 或输入数字 [1-3] 修改, [q] 退出: "
-    read -r choice
+    read -r choice </dev/tty
 
     case "$choice" in
         "")
@@ -109,17 +109,17 @@ while true; do
             ;;
         1)
             printf "请输入新的内存大小 (GiB) [%s]: " "$MEM_G"
-            read -r new_mem
+            read -r new_mem </dev/tty
             MEM_G="${new_mem:-$MEM_G}"
             ;;
         2)
             printf "请输入您的服务器出口带宽 (Mbps) [%s]: " "$BW_Mbps"
-            read -r new_bw
+            read -r new_bw </dev/tty
             BW_Mbps="${new_bw:-$BW_Mbps}"
             ;;
         3)
             printf "请输入新的网络延迟 RTT (ms) [%s]: " "$RTT_ms"
-            read -r new_rtt
+            read -r new_rtt </dev/tty
             RTT_ms="${new_rtt:-$RTT_ms}"
             ;;
         q|Q)
