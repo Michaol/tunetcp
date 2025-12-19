@@ -13,8 +13,11 @@
 - **非交互模式**: 支持命令行参数，适合脚本化部署
 - **自动冲突处理**: 扫描并处理现有冲突配置，通过备份解决配置覆盖问题
 - **即时生效与持久化**: 配置即时生效并写入 `/etc/sysctl.d/`，重启后依然有效
-- **安全优先**: root 权限检查，所有修改都有时间戳备份，启用 SYN cookies 防护
-- **全平台兼容**: 支持 Debian/Ubuntu/CentOS/Fedora/Alpine 等所有 Linux 发行版
+- **安全优先**: 提供内核版本（4.9+）兼容性检查，脚本安全加固 `pipefail`
+- **全平台兼容**: 严格遵循 **POSIX** 标准，完美支持 Debian/Ubuntu/CentOS/Fedora/Alpine (BusyBox) 等
+- **预览模式**: 新增 `--dry-run` 参数，无需修改系统即可预览生成的配置
+- **性能优化**: 动态正则表达式生成，减少冗余调用，系统资源占用极低
+- **调试模式**: 提供 `-d/--debug` 参数，详细记录执行流与决策逻辑
 
 ## 一键运行
 
@@ -35,6 +38,8 @@ wget -qO tunetcp.sh https://raw.githubusercontent.com/Michaol/tunetcp/main/tunet
   -r, --rtt <ms>      指定网络延迟（默认自动检测）
   -y, --yes           跳过确认，直接应用
   --uninstall         卸载优化配置，恢复系统默认
+  --dry-run           只预览配置，不实际写入系统
+  -d, --debug         开启调试模式
   -h, --help          显示帮助信息
 ```
 
