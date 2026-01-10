@@ -204,6 +204,13 @@ get_mem_bytes() {
 }
 
 get_rtt_ms() {
+    # In non-interactive mode (pipe), use default RTT to avoid ping failures
+    if [ "$SKIP_CONFIRM" = "1" ] && [ -z "${SSH_CONNECTION-}" ]; then
+        note "Non-interactive mode without SSH, using default RTT: 100 ms"
+        echo "100"
+        return
+    fi
+    
     ping_target=""
     ping_desc=""
 
@@ -231,21 +238,28 @@ get_rtt_ms() {
     
     # Check if ping is available and works
     if ! command -v ping >/dev/null 2>&1; then
-        warn "ping command not available, using default 150 ms"
-        echo "150"
+        warn "ping command not available, using default 100 ms"
+        echo "100"
         return
     fi
     
-    ping_result=$(ping -c 4 -W 2 "$ping_target" 2>/dev/null | tail -1 | awk -F'/' '{print $5}')
+    # Run ping and extract RTT
+    ping_output=$(ping -c 4 -W 2 "$ping_target" 2>/dev/null || true)
+    ping_result=$(echo "$ping_output" | tail -1 | awk -F'/' '{print $5}')
     
-    is_ping_num=$(echo "$ping_result" | awk '/^[0-9]+([.][0-9]+)?$/ {print 1}')
-    if [ "$is_ping_num" = "1" ]; then
-        ok "Detected average RTT: ${ping_result} ms"
-        echo "$ping_result" | awk '{printf "%.0f\n", $1}'
-    else
-        warn "Ping ${ping_target} failed. Using default 150 ms."
-        echo "150"
+    # Validate ping result is a number
+    if [ -n "$ping_result" ] && echo "$ping_result" | grep -qE '^[0-9]+\.?[0-9]*$'; then
+        # Round to integer
+        rtt_int=$(printf "%.0f" "$ping_result" 2>/dev/null || echo "100")
+        if [ "$rtt_int" -gt 0 ] 2>/dev/null; then
+            ok "Detected average RTT: ${rtt_int} ms"
+            echo "$rtt_int"
+            return
+        fi
     fi
+    
+    warn "Ping ${ping_target} failed or returned invalid result. Using default 100 ms."
+    echo "100"
 }
 
 # --- BusyBox compatible sysctl apply ---
