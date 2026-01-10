@@ -925,6 +925,8 @@ SYSCTL_EOF
     printf "    - %-25s : %s\n" "TCP Timestamps" "$(sysctl -n net.ipv4.tcp_timestamps 2>/dev/null || echo "unknown")"
     printf "    - %-25s : %s\n" "TCP SACK" "$(sysctl -n net.ipv4.tcp_sack 2>/dev/null || echo "unknown")"
     printf "    - %-25s : %s\n" "TCP SYN Cookies" "$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null || echo "unknown")"
+    printf "    - %-25s : %s\n" "UDP rmem_min" "$(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || echo "unknown")"
+    printf "    - %-25s : %s\n" "UDP wmem_min" "$(sysctl -n net.ipv4.udp_wmem_min 2>/dev/null || echo "unknown")"
     echo
     
     if command -v tc >/dev/null 2>&1 && [ -n "${IFACE-}" ]; then
