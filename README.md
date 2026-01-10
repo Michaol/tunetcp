@@ -34,11 +34,14 @@
 以 root 用户身份登录 Linux 服务器，执行以下命令：
 
 ```bash
-# 交互模式（推荐，支持确认参数和RTT检测）
-wget -qO tunetcp.sh https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh && chmod +x tunetcp.sh && sudo ./tunetcp.sh
+# 使用 wget（交互模式）
+rm -f tunetcp.sh && wget -qO tunetcp.sh https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh && chmod +x tunetcp.sh && sudo ./tunetcp.sh
+
+# 使用 curl（交互模式）
+rm -f tunetcp.sh && curl -fsSL -o tunetcp.sh https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh && chmod +x tunetcp.sh && sudo ./tunetcp.sh
 
 # 非交互模式（使用默认参数直接应用）
-wget -qO tunetcp.sh https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh && chmod +x tunetcp.sh && sudo ./tunetcp.sh -y
+rm -f tunetcp.sh && wget -qO tunetcp.sh https://raw.githubusercontent.com/Michaol/tunetcp/main/tunetcp.sh && chmod +x tunetcp.sh && sudo ./tunetcp.sh -y
 ```
 
 ## 命令行参数
