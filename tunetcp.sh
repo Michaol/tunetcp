@@ -780,8 +780,7 @@ net.core.optmem_max = 262144
 net.ipv4.tcp_rmem = ${TCP_RMEM_MIN} ${TCP_RMEM_DEF} ${TCP_RMEM_MAX}
 net.ipv4.tcp_wmem = ${TCP_WMEM_MIN} ${TCP_WMEM_DEF} ${TCP_WMEM_MAX}
 
-# TCP memory pressure thresholds (AGGRESSIVE)
-net.ipv4.tcp_mem = 786432 1048576 26777216
+# Note: tcp_mem removed to let kernel auto-manage memory pressure
 
 # -----------------------------------------------------------------------------
 # TCP Performance Tuning (AGGRESSIVE)
@@ -820,11 +819,11 @@ net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_fin_timeout = 10
 
 # -----------------------------------------------------------------------------
-# TCP Connection Reuse & Limits (AGGRESSIVE)
+# TCP Connection Reuse & Limits
 # -----------------------------------------------------------------------------
-net.ipv4.tcp_tw_reuse = 2
-net.ipv4.tcp_max_tw_buckets = 2000000
-net.ipv4.tcp_max_orphans = 262144
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_max_tw_buckets = 65535
+net.ipv4.tcp_max_orphans = 32768
 net.ipv4.tcp_syncookies = 1
 
 # -----------------------------------------------------------------------------
