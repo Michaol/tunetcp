@@ -3,14 +3,15 @@ set -eu
 set -o pipefail 2>/dev/null || true
 
 # =========================================================
-# TuneTCP v2.2 - Linux TCP/UDP Network Optimization Tool
-# - POSIX compliant, supports all Linux distros (including Alpine/BusyBox)
-# - Optimizes both IPv4 and IPv6 (dual-stack and single-stack)
-# - Supports CLI args, non-interactive mode, uninstall
+# TuneTCP v3.0 - 最激进TCP/UDP网络优化工具
+# - 性能优先策略，最大化网络吞吐量
+# - 支持BBR v1/v2/v3自动检测
+# - 针对512MB-2GB内存VPS优化
+# - 双栈支持IPv4+IPv6，POSIX兼容
 # https://github.com/Michaol/tunetcp
 # =========================================================
 
-VERSION="2.2.0"
+VERSION="3.0.0"
 SYSCTL_TARGET="/etc/sysctl.d/999-net-bbr-fq.conf"
 
 # --- Colors ---
@@ -95,20 +96,40 @@ check_requirements() {
     debug "System requirements check passed"
 }
 
-# --- Kernel version check ---
+# --- Kernel version check with BBR version detection ---
 check_kernel() {
     local kernel_ver=$(uname -r | cut -d'-' -f1)
-    note "Current kernel version: ${kernel_ver}"
+    note "当前内核版本: ${kernel_ver}"
     
-    # BBR requires Linux 4.9+
     local major=$(echo "$kernel_ver" | cut -d'.' -f1)
     local minor=$(echo "$kernel_ver" | cut -d'.' -f2)
     
+    # Check for BBR v3 (6.6+)
+    if [ "$major" -gt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -ge 6 ]; }; then
+        if sysctl -a 2>/dev/null | grep -q 'net.ipv4.tcp_available_congestion_control.*bbr'; then
+            if modprobe tcp_bbr 2>/dev/null || true; then
+                note "检测到BBR支持 (内核 ${kernel_ver})"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Check for BBR v2 (5.18+)
+    if [ "$major" -gt 5 ] || { [ "$major" -eq 5 ] && [ "$minor" -ge 18 ]; }; then
+        if sysctl -a 2>/dev/null | grep -q 'net.ipv4.tcp_available_congestion_control.*bbr'; then
+            note "检测到BBR支持 (内核 ${kernel_ver})"
+            return 0
+        fi
+    fi
+    
+    # Check for BBR v1 (4.9+)
     if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
-        warn "Kernel version ${kernel_ver} is too old for BBR (requires 4.9+)."
-        warn "BBR settings will be skipped."
+        warn "内核版本 ${kernel_ver} 过旧，不支持BBR (需要 4.9+)"
+        warn "BBR设置将被跳过"
         return 1
     fi
+    
+    note "内核版本支持BBR (${kernel_ver})"
     return 0
 }
 
@@ -330,7 +351,7 @@ default_iface() {
 }
 
 # --- Key definitions ---
-# List of sysctl keys we manage
+# List of sysctl keys we manage (including aggressive parameters)
 SYSCTL_KEYS="net.core.default_qdisc \
 net.core.rmem_max \
 net.core.wmem_max \
@@ -338,9 +359,14 @@ net.core.rmem_default \
 net.core.wmem_default \
 net.ipv4.tcp_rmem \
 net.ipv4.tcp_wmem \
+net.ipv4.tcp_mem \
 net.ipv4.tcp_congestion_control \
 net.ipv4.tcp_slow_start_after_idle \
 net.ipv4.tcp_notsent_lowat \
+net.ipv4.tcp_no_metrics_save \
+net.ipv4.tcp_moderate_rcvbuf \
+net.ipv4.tcp_ecn \
+net.ipv4.tcp_ecn_fallback \
 net.core.somaxconn \
 net.ipv4.tcp_max_syn_backlog \
 net.core.netdev_max_backlog \
@@ -351,13 +377,20 @@ net.core.optmem_max \
 net.ipv4.tcp_fastopen \
 net.ipv4.tcp_fin_timeout \
 net.ipv4.tcp_tw_reuse \
-net.ipv4.tcp_keepalive \
+net.ipv4.tcp_keepalive_time \
+net.ipv4.tcp_keepalive_intvl \
+net.ipv4.tcp_keepalive_probes \
 net.ipv4.tcp_syncookies \
 net.ipv4.tcp_max_tw_buckets \
+net.ipv4.tcp_max_orphans \
 net.ipv4.tcp_window_scaling \
 net.ipv4.tcp_timestamps \
 net.ipv4.tcp_sack \
-net.ipv4.tcp_mtu_probing"
+net.ipv4.tcp_mtu_probing \
+net.core.netdev_budget \
+net.core.netdev_budget_usecs \
+net.ipv6.conf.all.disable_ipv6 \
+net.ipv6.conf.default.disable_ipv6"
 
 # Function to build regex from keys
 get_key_regex() {
@@ -668,35 +701,65 @@ main() {
     
     BDP_BYTES=$(awk -v bw="$BW_Mbps" -v rtt="$RTT_ms" 'BEGIN{ printf "%.0f", bw*125*rtt }')
     MEM_BYTES=$(get_mem_bytes "$MEM_G")
-    TWO_BDP=$(( BDP_BYTES*2 ))
-    RAM3_BYTES=$(awk -v m="$MEM_BYTES" 'BEGIN{ printf "%.0f", m*0.03 }')
-    CAP64=$(( 64*1024*1024 ))
-    MAX_NUM_BYTES=$(awk -v a="$TWO_BDP" -v b="$RAM3_BYTES" -v c="$CAP64" 'BEGIN{ m=a; if(b<m)m=b; if(c<m)m=c; printf "%.0f", m }')
+    FOUR_BDP=$(( BDP_BYTES*4 ))
+    
+    # Aggressive tiered strategy based on memory (optimized for 512MB-2GB VPS)
+    mem_g_int=$(printf "%.0f" "$MEM_G")
+    debug "Memory tier: ${mem_g_int}GB"
+    
+    if [ "$mem_g_int" -ge 2 ]; then
+        # 2GB+ memory: Fully aggressive
+        MIN_BUF=$(( 256*1024*1024 ))  # 256MB
+        CAP_BUF=$(( 512*1024*1024 ))  # 512MB
+        RAM_PCT=0.10
+        TCP_RMEM_MIN=16384; TCP_RMEM_DEF=524288    # 16KB, 512KB
+        TCP_WMEM_MIN=16384; TCP_WMEM_DEF=524288
+        UDP_RMEM_MIN=65536; UDP_WMEM_MIN=65536     # 64KB
+        DEF_R=262144; DEF_W=524288                 # 256KB, 512KB
+        debug "Tier: Fully aggressive (2GB+)"
+    elif [ "$mem_g_int" -ge 1 ]; then
+        # 1-2GB memory: Standard aggressive
+        MIN_BUF=$(( 128*1024*1024 ))  # 128MB
+        CAP_BUF=$(( 256*1024*1024 ))  # 256MB
+        RAM_PCT=0.10
+        TCP_RMEM_MIN=8192; TCP_RMEM_DEF=262144     # 8KB, 256KB
+        TCP_WMEM_MIN=8192; TCP_WMEM_DEF=262144
+        UDP_RMEM_MIN=32768; UDP_WMEM_MIN=32768     # 32KB
+        DEF_R=131072; DEF_W=262144                 # 128KB, 256KB
+        debug "Tier: Standard aggressive (1-2GB)"
+    else
+        # 512MB-1GB memory: Conservative aggressive
+        MIN_BUF=$(( 64*1024*1024 ))   # 64MB
+        CAP_BUF=$(( 128*1024*1024 ))  # 128MB
+        RAM_PCT=0.08
+        TCP_RMEM_MIN=8192; TCP_RMEM_DEF=131072     # 8KB, 128KB
+        TCP_WMEM_MIN=8192; TCP_WMEM_DEF=131072
+        UDP_RMEM_MIN=16384; UDP_WMEM_MIN=16384     # 16KB
+        DEF_R=131072; DEF_W=131072                 # 128KB, 128KB
+        debug "Tier: Conservative aggressive (512MB-1GB)"
+    fi
+    
+    RAM_PCT_BYTES=$(awk -v m="$MEM_BYTES" -v pct="$RAM_PCT" 'BEGIN{ printf "%.0f", m*pct }')
+    
+    # Take max(4*BDP, RAM percentage) but not less than MIN_BUF, not more than CAP_BUF
+    MAX_NUM_BYTES=$(awk -v bdp="$FOUR_BDP" -v ram="$RAM_PCT_BYTES" -v min="$MIN_BUF" -v cap="$CAP_BUF" \
+        'BEGIN{ m=bdp; if(ram>m)m=ram; if(m<min)m=min; if(m>cap)m=cap; printf "%.0f", m }')
     
     MAX_MB_NUM=$(( MAX_NUM_BYTES/1024/1024 ))
     MAX_MB=$(bucket_le_mb "$MAX_MB_NUM")
     MAX_BYTES=$(( MAX_MB*1024*1024 ))
     
-    debug "BDP: $BDP_BYTES bytes, Max buffer: $MAX_BYTES bytes"
+    debug "BDP: $BDP_BYTES bytes (4x multiplier), Max buffer: $MAX_BYTES bytes"
+    debug "TCP min/def/max: $TCP_RMEM_MIN/$TCP_RMEM_DEF/$MAX_BYTES"
     
-    # Dynamic default buffer sizes based on memory
-    if [ "$MAX_MB" -ge 32 ]; then
-        DEF_R=262144; DEF_W=524288
-    elif [ "$MAX_MB" -ge 8 ]; then
-        DEF_R=131072; DEF_W=262144
-    else
-        DEF_R=131072; DEF_W=131072
-    fi
+    TCP_RMEM_MAX=$MAX_BYTES
+    TCP_WMEM_MAX=$MAX_BYTES
     
-    # TCP buffer min/default/max
-    TCP_RMEM_MIN=4096; TCP_RMEM_DEF=131072; TCP_RMEM_MAX=$MAX_BYTES
-    TCP_WMEM_MIN=4096; TCP_WMEM_DEF=131072; TCP_WMEM_MAX=$MAX_BYTES
+    # Dynamic queue sizes - always use maximum for aggressive performance
+    SOMAXCONN=65535
+    NETDEV_BACKLOG=65535
     
-    # Dynamic queue sizes
-    SOMAXCONN=$(get_somaxconn)
-    NETDEV_BACKLOG=$(get_netdev_backlog)
-    
-    debug "Dynamic params: somaxconn=$SOMAXCONN, backlog=$NETDEV_BACKLOG"
+    debug "Fixed aggressive queues: somaxconn=$SOMAXCONN, backlog=$NETDEV_BACKLOG"
     
     # ---- Cleanup conflicts ----
     note "Step A: Backup and comment /etc/sysctl.conf conflicts"
@@ -722,14 +785,15 @@ main() {
     
     BDP_MB_display=$(awk -v b="$BDP_BYTES" 'BEGIN{ printf "%.2f", b/1024/1024 }')
     
-    cat > "$tmpf" << SYSCTL_EOF
+    cat > "$tmpf" <<SYSCTL_EOF
 # =============================================================================
 # Auto-generated by TuneTCP v${VERSION} (https://github.com/Michaol/tunetcp)
-# Optimized for: IPv4 + IPv6, TCP + UDP (dual-stack compatible)
+# AGGRESSIVE Performance Optimization for IPv4 + IPv6, TCP + UDP
 # =============================================================================
 # Inputs: MEM_G=${MEM_G}GiB, BW=${BW_Mbps}Mbps, RTT=${RTT_ms}ms
-# BDP: ${BDP_BYTES} bytes (~${BDP_MB_display} MB)
-# Caps: min(2*BDP, 3%RAM, 64MB) -> Bucket ${MAX_MB} MB
+# BDP: ${BDP_BYTES} bytes (~${BDP_MB_display} MB) * 4 multiplier
+# Strategy: max(4*BDP, ${RAM_PCT}*RAM), Min ${MIN_BUF}/1024/1024 MB, Cap ${CAP_BUF}/1024/1024 MB
+# Memory Tier: ${mem_g_int}GB
 
 # -----------------------------------------------------------------------------
 # Congestion Control & Queue Discipline
@@ -742,23 +806,28 @@ else
 fi)
 
 # -----------------------------------------------------------------------------
-# Core Buffer Sizes (applies to both IPv4 and IPv6)
+# Core Buffer Sizes (aggressive, tiered by memory)
 # -----------------------------------------------------------------------------
 net.core.rmem_default = ${DEF_R}
 net.core.wmem_default = ${DEF_W}
 net.core.rmem_max = ${MAX_BYTES}
 net.core.wmem_max = ${MAX_BYTES}
-net.core.optmem_max = 65536
+net.core.optmem_max = 262144
 
 # -----------------------------------------------------------------------------
-# TCP Buffer Sizes (shared by IPv4 and IPv6 TCP stack)
+# TCP Buffer Sizes (aggressive min and default values)
 # Format: min default max
 # -----------------------------------------------------------------------------
 net.ipv4.tcp_rmem = ${TCP_RMEM_MIN} ${TCP_RMEM_DEF} ${TCP_RMEM_MAX}
 net.ipv4.tcp_wmem = ${TCP_WMEM_MIN} ${TCP_WMEM_DEF} ${TCP_WMEM_MAX}
 
 # -----------------------------------------------------------------------------
-# TCP Performance Tuning
+# Aggressive TCP Memory Pressure Thresholds (in pages, 4KB each)
+# -----------------------------------------------------------------------------
+net.ipv4.tcp_mem = 786432 1048576 26777216
+
+# -----------------------------------------------------------------------------
+# TCP Performance Tuning (aggressive settings)
 # -----------------------------------------------------------------------------
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
@@ -768,34 +837,55 @@ net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 
-# -----------------------------------------------------------------------------
-# Connection Queue Sizes (dynamic based on memory/bandwidth)
-# -----------------------------------------------------------------------------
-net.core.somaxconn = ${SOMAXCONN}
-net.ipv4.tcp_max_syn_backlog = ${SOMAXCONN}
-net.core.netdev_max_backlog = ${NETDEV_BACKLOG}
+# Aggressive congestion window settings
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_moderate_rcvbuf = 0
+
+# Enable ECN (Explicit Congestion Notification)
+net.ipv4.tcp_ecn = 1
+net.ipv4.tcp_ecn_fallback = 1
 
 # -----------------------------------------------------------------------------
-# TCP Keepalive & Timeout Settings
+# Connection Queue Sizes (fixed maximum for aggressive performance)
 # -----------------------------------------------------------------------------
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.tcp_fin_timeout = 15
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
 
 # -----------------------------------------------------------------------------
-# TCP Connection Reuse & Security
+# TCP Keepalive & Timeout Settings (aggressive, minimize latency)
 # -----------------------------------------------------------------------------
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_max_tw_buckets = 65535
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_fin_timeout = 10
+
+# -----------------------------------------------------------------------------
+# TCP Connection Reuse & Security (aggressive reuse)
+# -----------------------------------------------------------------------------
+net.ipv4.tcp_tw_reuse = 2
+net.ipv4.tcp_max_tw_buckets = 2000000
 net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_orphans = 262144
 
 # -----------------------------------------------------------------------------
-# Port Range & UDP Settings
+# Port Range & UDP Settings (maximize available ports, aggressive UDP buffers)
 # -----------------------------------------------------------------------------
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
+net.ipv4.udp_rmem_min = ${UDP_RMEM_MIN}
+net.ipv4.udp_wmem_min = ${UDP_WMEM_MIN}
+
+# -----------------------------------------------------------------------------
+# Network Device Budget (aggressive packet processing)
+# -----------------------------------------------------------------------------
+net.core.netdev_budget = 50000
+net.core.netdev_budget_usecs = 5000
+
+# -----------------------------------------------------------------------------
+# IPv6 Optimization (ensure IPv6 is enabled)
+# -----------------------------------------------------------------------------
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
 SYSCTL_EOF
 
     # Validate config file
@@ -818,14 +908,28 @@ SYSCTL_EOF
     # Apply configuration
     apply_sysctl_settings
     
-    # Apply tc qdisc
+    # Apply tc qdisc with aggressive FQ parameters
     IFACE="$(default_iface)"
     if command -v tc >/dev/null 2>&1 && [ -n "${IFACE-}" ]; then
-        note "Setting fq qdisc for interface ${IFACE}..."
-        if tc qdisc replace dev "$IFACE" root fq 2>/dev/null; then
-            ok "TC qdisc applied successfully"
+        note "Setting aggressive fq qdisc for interface ${IFACE}..."
+        if tc qdisc replace dev "$IFACE" root fq \
+            limit 100000 \
+            flow_limit 1000 \
+            quantum 3028 \
+            initial_quantum 15140 \
+            maxrate 0 \
+            buckets 1024 \
+            orphan_mask 1023 \
+            pacing \
+            ce_threshold 0 2>/dev/null; then
+            ok "TC qdisc applied successfully with aggressive parameters"
         else
-            warn "Failed to apply TC qdisc"
+            warn "Failed to apply aggressive TC qdisc, trying basic fq..."
+            if tc qdisc replace dev "$IFACE" root fq 2>/dev/null; then
+                ok "TC qdisc applied with basic fq"
+            else
+                warn "Failed to apply TC qdisc"
+            fi
         fi
     fi
     
