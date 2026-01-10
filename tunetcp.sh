@@ -1,7 +1,6 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 set -eu
 set -o pipefail 2>/dev/null || true
-export LC_ALL=C
 
 # =========================================================
 # TuneTCP v3.0 - 最激进TCP/UDP网络优化工具
@@ -31,11 +30,6 @@ check_tty() {
         YELLOW=''
         RED=''
         RESET=''
-    fi
-    
-    # If stdin is not a terminal (e.g. pipe), forcing non-interactive mode
-    if [ ! -t 0 ]; then
-        SKIP_CONFIRM=1
     fi
 }
 check_tty
@@ -204,13 +198,6 @@ get_mem_bytes() {
 }
 
 get_rtt_ms() {
-    # In non-interactive mode (pipe), use default RTT to avoid ping failures
-    if [ "$SKIP_CONFIRM" = "1" ] && [ -z "${SSH_CONNECTION-}" ]; then
-        note "Non-interactive mode without SSH, using default RTT: 100 ms"
-        echo "100"
-        return
-    fi
-    
     ping_target=""
     ping_desc=""
 
@@ -238,28 +225,21 @@ get_rtt_ms() {
     
     # Check if ping is available and works
     if ! command -v ping >/dev/null 2>&1; then
-        warn "ping command not available, using default 100 ms"
-        echo "100"
+        warn "ping command not available, using default 150 ms"
+        echo "150"
         return
     fi
     
-    # Run ping and extract RTT
-    ping_output=$(ping -c 4 -W 2 "$ping_target" 2>/dev/null || true)
-    ping_result=$(echo "$ping_output" | tail -1 | awk -F'/' '{print $5}')
+    ping_result=$(ping -c 4 -W 2 "$ping_target" 2>/dev/null | tail -1 | awk -F'/' '{print $5}')
     
-    # Validate ping result is a number
-    if [ -n "$ping_result" ] && echo "$ping_result" | grep -qE '^[0-9]+\.?[0-9]*$'; then
-        # Round to integer
-        rtt_int=$(printf "%.0f" "$ping_result" 2>/dev/null || echo "100")
-        if [ "$rtt_int" -gt 0 ] 2>/dev/null; then
-            ok "Detected average RTT: ${rtt_int} ms"
-            echo "$rtt_int"
-            return
-        fi
+    is_ping_num=$(echo "$ping_result" | awk '/^[0-9]+([.][0-9]+)?$/ {print 1}')
+    if [ "$is_ping_num" = "1" ]; then
+        ok "Detected average RTT: ${ping_result} ms"
+        echo "$ping_result" | awk '{printf "%.0f\n", $1}'
+    else
+        warn "Ping ${ping_target} failed. Using default 150 ms."
+        echo "150"
     fi
-    
-    warn "Ping ${ping_target} failed or returned invalid result. Using default 100 ms."
-    echo "100"
 }
 
 # --- BusyBox compatible sysctl apply ---
@@ -656,7 +636,7 @@ main() {
     # Validate inputs
     show_progress 3 5 "Validating parameters..."
     if [ ! "$(is_num "$MEM_G")" = "1" ] || [ ! "$(is_int "$BW_Mbps")" = "1" ] || [ ! "$(is_num "$RTT_ms")" = "1" ]; then
-        bad "Parameters contain invalid non-numeric input. MEM=${MEM_G}, BW=${BW_Mbps}, RTT=${RTT_ms}"
+        bad "Parameters contain invalid non-numeric input."
     fi
     validate_params
     
