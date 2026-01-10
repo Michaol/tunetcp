@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -eu
 set -o pipefail 2>/dev/null || true
+export LC_ALL=C
 
 # =========================================================
 # TuneTCP v3.0 - 最激进TCP/UDP网络优化工具
@@ -30,6 +31,11 @@ check_tty() {
         YELLOW=''
         RED=''
         RESET=''
+    fi
+    
+    # If stdin is not a terminal (e.g. pipe), forcing non-interactive mode
+    if [ ! -t 0 ]; then
+        SKIP_CONFIRM=1
     fi
 }
 check_tty
@@ -636,7 +642,7 @@ main() {
     # Validate inputs
     show_progress 3 5 "Validating parameters..."
     if [ ! "$(is_num "$MEM_G")" = "1" ] || [ ! "$(is_int "$BW_Mbps")" = "1" ] || [ ! "$(is_num "$RTT_ms")" = "1" ]; then
-        bad "Parameters contain invalid non-numeric input."
+        bad "Parameters contain invalid non-numeric input. MEM=${MEM_G}, BW=${BW_Mbps}, RTT=${RTT_ms}"
     fi
     validate_params
     
