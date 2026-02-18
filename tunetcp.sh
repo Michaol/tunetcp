@@ -3,14 +3,14 @@ set -eu
 set -o pipefail 2>/dev/null || true
 
 # =========================================================
-# TuneTCP v2.2 - Linux TCP/UDP Network Optimization Tool
+# TuneTCP v2.4 - Linux TCP/UDP Network Optimization Tool
 # - POSIX compliant, supports all Linux distros (including Alpine/BusyBox)
 # - Optimizes both IPv4 and IPv6 (dual-stack and single-stack)
 # - Supports CLI args, non-interactive mode, uninstall
 # https://github.com/Michaol/tunetcp
 # =========================================================
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 SYSCTL_TARGET="/etc/sysctl.d/999-net-bbr-fq.conf"
 
 # --- Colors ---
@@ -336,28 +336,34 @@ net.core.rmem_max \
 net.core.wmem_max \
 net.core.rmem_default \
 net.core.wmem_default \
+net.core.optmem_max \
+net.core.somaxconn \
+net.core.netdev_max_backlog \
+net.core.netdev_budget \
+net.core.netdev_budget_usecs \
 net.ipv4.tcp_rmem \
 net.ipv4.tcp_wmem \
 net.ipv4.tcp_congestion_control \
 net.ipv4.tcp_slow_start_after_idle \
 net.ipv4.tcp_notsent_lowat \
-net.core.somaxconn \
+net.ipv4.tcp_moderate_rcvbuf \
 net.ipv4.tcp_max_syn_backlog \
-net.core.netdev_max_backlog \
-net.ipv4.ip_local_port_range \
-net.ipv4.udp_rmem_min \
-net.ipv4.udp_wmem_min \
-net.core.optmem_max \
 net.ipv4.tcp_fastopen \
 net.ipv4.tcp_fin_timeout \
 net.ipv4.tcp_tw_reuse \
-net.ipv4.tcp_keepalive \
+net.ipv4.tcp_keepalive_time \
+net.ipv4.tcp_keepalive_intvl \
+net.ipv4.tcp_keepalive_probes \
 net.ipv4.tcp_syncookies \
 net.ipv4.tcp_max_tw_buckets \
 net.ipv4.tcp_window_scaling \
 net.ipv4.tcp_timestamps \
 net.ipv4.tcp_sack \
-net.ipv4.tcp_mtu_probing"
+net.ipv4.tcp_mtu_probing \
+net.ipv4.ip_local_port_range \
+net.ipv4.udp_rmem_min \
+net.ipv4.udp_wmem_min \
+net.ipv4.udp_mem"
 
 # Function to build regex from keys
 get_key_regex() {
@@ -489,14 +495,12 @@ scan_conflicts_ro() {
 # --- Dynamic bucket functions ---
 bucket_le_mb() {
     local mb="${1:-0}"
-    case $mb in
-        [6-9][0-9]*) echo 64 ;;
-        3[2-9]*) echo 32 ;;
-        1[6-9]*) echo 16 ;;
-        8*) echo 8 ;;
-        4*) echo 4 ;;
-        *) echo 4 ;;
-    esac
+    if [ "$mb" -ge 64 ]; then echo 64
+    elif [ "$mb" -ge 32 ]; then echo 32
+    elif [ "$mb" -ge 16 ]; then echo 16
+    elif [ "$mb" -ge 8 ]; then echo 8
+    else echo 4
+    fi
 }
 
 # Dynamic somaxconn based on memory
@@ -509,13 +513,23 @@ get_somaxconn() {
     fi
 }
 
-# Dynamic netdev_max_backlog based on bandwidth
+# Dynamic netdev_max_backlog based on bandwidth (ESnet/Google recommended)
 get_netdev_backlog() {
-    if [ "$BW_Mbps" -ge 10000 ]; then echo 65535
-    elif [ "$BW_Mbps" -ge 1000 ]; then echo 32768
-    elif [ "$BW_Mbps" -ge 100 ]; then echo 16384
-    else echo 8192
+    if [ "$BW_Mbps" -ge 10000 ]; then echo 250000
+    elif [ "$BW_Mbps" -ge 1000 ]; then echo 65535
+    elif [ "$BW_Mbps" -ge 100 ]; then echo 32768
+    else echo 10000
     fi
+}
+
+# Dynamic UDP memory limits based on system memory (in pages, 1 page = 4KB)
+get_udp_mem() {
+    local mem_bytes="$1"
+    local total_pages=$(awk -v m="$mem_bytes" 'BEGIN{ printf "%.0f", m/4096 }')
+    local low=$(awk -v p="$total_pages" 'BEGIN{ printf "%.0f", p*0.03 }')
+    local pressure=$(awk -v p="$total_pages" 'BEGIN{ printf "%.0f", p*0.04 }')
+    local high=$(awk -v p="$total_pages" 'BEGIN{ printf "%.0f", p*0.06 }')
+    echo "$low $pressure $high"
 }
 
 # --- Progress indicator ---
@@ -679,24 +693,25 @@ main() {
     
     debug "BDP: $BDP_BYTES bytes, Max buffer: $MAX_BYTES bytes"
     
-    # Dynamic default buffer sizes based on memory
-    if [ "$MAX_MB" -ge 32 ]; then
-        DEF_R=262144; DEF_W=524288
-    elif [ "$MAX_MB" -ge 8 ]; then
-        DEF_R=131072; DEF_W=262144
+    # Dynamic default buffer sizes based on BDP bucket
+    if [ "$MAX_MB" -ge 8 ]; then
+        DEF_R=262144; DEF_W=262144
     else
         DEF_R=131072; DEF_W=131072
     fi
     
-    # TCP buffer min/default/max
+    # TCP buffer min/default/max (ESnet: tcp_wmem default=65536)
     TCP_RMEM_MIN=4096; TCP_RMEM_DEF=131072; TCP_RMEM_MAX=$MAX_BYTES
-    TCP_WMEM_MIN=4096; TCP_WMEM_DEF=131072; TCP_WMEM_MAX=$MAX_BYTES
+    TCP_WMEM_MIN=4096; TCP_WMEM_DEF=65536; TCP_WMEM_MAX=$MAX_BYTES
+    
+    # UDP memory limits
+    UDP_MEM=$(get_udp_mem "$MEM_BYTES")
     
     # Dynamic queue sizes
     SOMAXCONN=$(get_somaxconn)
     NETDEV_BACKLOG=$(get_netdev_backlog)
     
-    debug "Dynamic params: somaxconn=$SOMAXCONN, backlog=$NETDEV_BACKLOG"
+    debug "Dynamic params: somaxconn=$SOMAXCONN, backlog=$NETDEV_BACKLOG, udp_mem=$UDP_MEM"
     
     # ---- Cleanup conflicts ----
     note "Step A: Backup and comment /etc/sysctl.conf conflicts"
@@ -742,13 +757,13 @@ else
 fi)
 
 # -----------------------------------------------------------------------------
-# Core Buffer Sizes (applies to both IPv4 and IPv6)
+# Core Buffer Sizes (applies to both IPv4 and IPv6, TCP and UDP)
 # -----------------------------------------------------------------------------
 net.core.rmem_default = ${DEF_R}
 net.core.wmem_default = ${DEF_W}
 net.core.rmem_max = ${MAX_BYTES}
 net.core.wmem_max = ${MAX_BYTES}
-net.core.optmem_max = 65536
+net.core.optmem_max = 524288
 
 # -----------------------------------------------------------------------------
 # TCP Buffer Sizes (shared by IPv4 and IPv6 TCP stack)
@@ -762,18 +777,21 @@ net.ipv4.tcp_wmem = ${TCP_WMEM_MIN} ${TCP_WMEM_DEF} ${TCP_WMEM_MAX}
 # -----------------------------------------------------------------------------
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_fastopen = 7
+net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 
 # -----------------------------------------------------------------------------
-# Connection Queue Sizes (dynamic based on memory/bandwidth)
+# Connection Queue & Softirq Budget
 # -----------------------------------------------------------------------------
 net.core.somaxconn = ${SOMAXCONN}
 net.ipv4.tcp_max_syn_backlog = ${SOMAXCONN}
 net.core.netdev_max_backlog = ${NETDEV_BACKLOG}
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000
 
 # -----------------------------------------------------------------------------
 # TCP Keepalive & Timeout Settings
@@ -791,13 +809,12 @@ net.ipv4.tcp_max_tw_buckets = 65535
 net.ipv4.tcp_syncookies = 1
 
 # -----------------------------------------------------------------------------
-# Port Range & UDP Settings (Enhanced for v2.3)
+# Port Range & UDP Settings (QUIC/WireGuard optimized)
 # -----------------------------------------------------------------------------
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.udp_rmem_min = 65536
-net.ipv4.udp_wmem_min = 65536
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.udp_mem = ${UDP_MEM}
 SYSCTL_EOF
 
     # Validate config file
@@ -857,6 +874,7 @@ SYSCTL_EOF
     printf "    - %-25s : %s\n" "somaxconn" "${SOMAXCONN}"
     printf "    - %-25s : %s\n" "tcp_max_syn_backlog" "${SOMAXCONN}"
     printf "    - %-25s : %s\n" "netdev_max_backlog" "${NETDEV_BACKLOG}"
+    printf "    - %-25s : %s\n" "udp_mem (low/pres/max)" "${UDP_MEM}"
     echo
     
     printf '%b[+] III. Kernel Verification%b\n' "$GREEN" "$RESET"
@@ -870,8 +888,11 @@ SYSCTL_EOF
     printf "    - %-25s : %s\n" "TCP Timestamps" "$(sysctl -n net.ipv4.tcp_timestamps 2>/dev/null || echo "unknown")"
     printf "    - %-25s : %s\n" "TCP SACK" "$(sysctl -n net.ipv4.tcp_sack 2>/dev/null || echo "unknown")"
     printf "    - %-25s : %s\n" "TCP SYN Cookies" "$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null || echo "unknown")"
+    printf "    - %-25s : %s\n" "TCP Fast Open" "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "unknown")"
+    printf "    - %-25s : %s\n" "TCP notsent_lowat" "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo "unknown")"
     printf "    - %-25s : %s\n" "UDP rmem_min" "$(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || echo "unknown")"
     printf "    - %-25s : %s\n" "UDP wmem_min" "$(sysctl -n net.ipv4.udp_wmem_min 2>/dev/null || echo "unknown")"
+    printf "    - %-25s : %s\n" "UDP mem" "$(sysctl -n net.ipv4.udp_mem 2>/dev/null || echo "unknown")"
     echo
     
     if command -v tc >/dev/null 2>&1 && [ -n "${IFACE-}" ]; then
