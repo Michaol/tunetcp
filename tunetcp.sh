@@ -3,14 +3,15 @@ set -eu
 set -o pipefail 2>/dev/null || true
 
 # =========================================================
-# TuneTCP v2.4 - Linux TCP/UDP Network Optimization Tool
+# TuneTCP v2.5 - Linux TCP/UDP Network Optimization Tool
 # - POSIX compliant, supports all Linux distros (including Alpine/BusyBox)
 # - Optimizes both IPv4 and IPv6 (dual-stack and single-stack)
-# - Supports CLI args, non-interactive mode, uninstall
+# - BBRv2 support, memory tiering, enhanced RTT detection
+# - Proxy/VPN optimized (RPS/XPS, conntrack, ECN, thin stream)
 # https://github.com/Michaol/tunetcp
 # =========================================================
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 SYSCTL_TARGET="/etc/sysctl.d/999-net-bbr-fq.conf"
 
 # --- Colors ---
@@ -37,6 +38,14 @@ check_tty
 MEM_BYTES=""
 BDP_BYTES=""
 INTERFACE=""
+CPU_CORES=""
+HAS_BBR2=0
+RPS_CONFIGURED=0
+CONNTRACK_AVAILABLE=0
+MEM_TIER=""
+RTT_JITTER=""
+RTT_LOSS=""
+RTT_TARGET=""
 
 # --- Helper functions ---
 note() { printf "${BLUE}[i]${RESET} %s\n" "$*" >&2; }
@@ -95,6 +104,50 @@ check_requirements() {
     debug "System requirements check passed"
 }
 
+# --- Detection functions ---
+check_bbr2_support() {
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe tcp_bbr2 2>/dev/null || true
+    fi
+    if grep -q bbr2 /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        HAS_BBR2=1
+        ok "BBRv2 supported and loaded"
+    else
+        HAS_BBR2=0
+        note "BBRv2 not available, will use BBRv1"
+    fi
+}
+
+get_cpu_cores() {
+    CPU_CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)
+    debug "CPU cores: $CPU_CORES"
+}
+
+check_conntrack_module() {
+    if [ -d /proc/sys/net/netfilter ]; then
+        CONNTRACK_AVAILABLE=1
+        debug "conntrack available"
+    elif modprobe nf_conntrack 2>/dev/null && [ -d /proc/sys/net/netfilter ]; then
+        CONNTRACK_AVAILABLE=1
+        debug "conntrack module loaded"
+    else
+        CONNTRACK_AVAILABLE=0
+        warn "conntrack not available, skipping conntrack optimization"
+    fi
+}
+
+get_mem_tier() {
+    local mem_g="$1"
+    if awk -v m="$mem_g" 'BEGIN { exit (m < 1) ? 0 : 1 }'; then
+        MEM_TIER="low"
+    elif awk -v m="$mem_g" 'BEGIN { exit (m < 4) ? 0 : 1 }'; then
+        MEM_TIER="medium"
+    else
+        MEM_TIER="high"
+    fi
+    debug "Memory tier: $MEM_TIER (${mem_g} GiB)"
+}
+
 # --- Kernel version check ---
 check_kernel() {
     local kernel_ver=$(uname -r | cut -d'-' -f1)
@@ -109,6 +162,15 @@ check_kernel() {
         warn "BBR settings will be skipped."
         return 1
     fi
+
+    # Check BBRv2 support (requires 5.8+)
+    if [ "$major" -gt 5 ] || { [ "$major" -eq 5 ] && [ "$minor" -ge 8 ]; }; then
+        check_bbr2_support
+    else
+        HAS_BBR2=0
+        note "Kernel < 5.8, BBRv2 not available, using BBRv1"
+    fi
+
     return 0
 }
 
@@ -177,48 +239,89 @@ get_mem_bytes() {
 }
 
 get_rtt_ms() {
-    ping_target=""
-    ping_desc=""
+    local ping_target=""
+    local ping_desc=""
 
+    # 1. Priority: SSH client IP
     if [ -n "${SSH_CONNECTION-}" ]; then
         ping_target=$(echo "$SSH_CONNECTION" | awk '{print $1}')
         ping_desc="SSH client ${ping_target}"
         note "Auto-detected SSH client IP: ${ping_target}"
-    elif [ "$SKIP_CONFIRM" != "1" ]; then
-        note "No SSH connection detected, please provide a client IP."
-        printf "Enter client IP for ping test (press Enter for 1.1.1.1): " </dev/tty
-        read -r client_ip 2>/dev/null || client_ip=""
+    fi
+
+    # 2. Interactive mode: user input
+    if [ -z "$ping_target" ] && [ "$SKIP_CONFIRM" != "1" ]; then
+        note "No SSH connection detected."
+        printf "Enter client IP for ping test: " </dev/tty
+        read -r client_ip </dev/tty || client_ip=""
         if [ -n "$client_ip" ]; then
             ping_target="$client_ip"
             ping_desc="Client IP ${ping_target}"
         fi
     fi
-    
+
+    # 3. Fallback: public DNS (if still no target)
     if [ -z "$ping_target" ]; then
-        ping_target="1.1.1.1"
-        ping_desc="Public address ${ping_target}"
-        note "Using ${ping_desc} for RTT test."
+        note "Trying fallback public DNS targets..."
+        for fallback in 1.1.1.1 8.8.8.8 223.5.5.5; do
+            if ping -c 1 -W 2 "$fallback" >/dev/null 2>&1; then
+                ping_target="$fallback"
+                ping_desc="Public DNS ${ping_target}"
+                note "Fallback target: ${ping_target}"
+                break
+            fi
+        done
     fi
 
-    note "Testing network latency via ping ${ping_desc}..."
-    
-    # Check if ping is available and works
+    # 4. All targets failed
+    if [ -z "$ping_target" ]; then
+        warn "All ping targets failed, using default 150 ms"
+        echo "150"
+        return
+    fi
+
+    # 5. Check ping availability
     if ! command -v ping >/dev/null 2>&1; then
         warn "ping command not available, using default 150 ms"
         echo "150"
         return
     fi
-    
-    ping_result=$(ping -c 4 -W 2 "$ping_target" 2>/dev/null | tail -1 | awk -F'/' '{print $5}')
-    
-    is_ping_num=$(echo "$ping_result" | awk '/^[0-9]+([.][0-9]+)?$/ {print 1}')
-    if [ "$is_ping_num" = "1" ]; then
-        ok "Detected average RTT: ${ping_result} ms"
-        echo "$ping_result" | awk '{printf "%.0f\n", $1}'
-    else
-        warn "Ping ${ping_target} failed. Using default 150 ms."
+
+    # 6. Execute ping test (10 packets)
+    note "Testing latency to ${ping_desc} (10 packets)..."
+    local ping_output
+    ping_output=$(ping -c 10 -W 3 "$ping_target" 2>/dev/null)
+
+    if [ $? -ne 0 ] || [ -z "$ping_output" ]; then
+        warn "Ping to ${ping_target} failed, using default 150 ms"
         echo "150"
+        return
     fi
+
+    # 7. Parse packet loss
+    RTT_LOSS=$(echo "$ping_output" | grep -oP '\d+(?=% packet loss)' || echo "0")
+    [ -z "$RTT_LOSS" ] && RTT_LOSS="0"
+
+    # 8. Parse RTT stats (min/avg/max/mdev)
+    local rtt_stats
+    rtt_stats=$(echo "$ping_output" | grep -oP 'rtt min/avg/max/mdev = \K[\d./]+' || echo "")
+
+    if [ -z "$rtt_stats" ]; then
+        warn "Failed to parse ping stats, using default 150 ms"
+        echo "150"
+        return
+    fi
+
+    local rtt_min rtt_avg rtt_max rtt_mdev
+    IFS='/' read -r rtt_min rtt_avg rtt_max rtt_mdev <<< "$rtt_stats"
+
+    RTT_JITTER="$rtt_mdev"
+    RTT_TARGET="$ping_target"
+
+    ok "RTT: ${rtt_avg} ms, Jitter: ${rtt_mdev} ms, Loss: ${RTT_LOSS}%"
+
+    # Return rounded average
+    echo "$rtt_avg" | awk '{printf "%.0f\n", $1}'
 }
 
 # --- BusyBox compatible sysctl apply ---
@@ -349,6 +452,7 @@ net.ipv4.tcp_notsent_lowat \
 net.ipv4.tcp_moderate_rcvbuf \
 net.ipv4.tcp_max_syn_backlog \
 net.ipv4.tcp_fastopen \
+net.ipv4.tcp_fastopen_connect \
 net.ipv4.tcp_fin_timeout \
 net.ipv4.tcp_tw_reuse \
 net.ipv4.tcp_keepalive_time \
@@ -360,10 +464,23 @@ net.ipv4.tcp_window_scaling \
 net.ipv4.tcp_timestamps \
 net.ipv4.tcp_sack \
 net.ipv4.tcp_mtu_probing \
+net.ipv4.tcp_retries1 \
+net.ipv4.tcp_retries2 \
+net.ipv4.tcp_syn_retries \
+net.ipv4.tcp_synack_retries \
+net.ipv4.tcp_abort_on_overflow \
+net.ipv4.tcp_ecn \
+net.ipv4.tcp_ecn_fallback \
+net.ipv4.tcp_thin_linear_timeouts \
+net.ipv4.tcp_thin_dupack \
 net.ipv4.ip_local_port_range \
 net.ipv4.udp_rmem_min \
 net.ipv4.udp_wmem_min \
-net.ipv4.udp_mem"
+net.ipv4.udp_mem \
+fs.file-max \
+vm.swappiness \
+vm.dirty_ratio \
+vm.dirty_background_ratio"
 
 # Function to build regex from keys
 get_key_regex() {
@@ -492,6 +609,85 @@ scan_conflicts_ro() {
     fi
 }
 
+# --- RPS/XPS & Conntrack configuration ---
+configure_rps_xps() {
+    local iface="$1"
+
+    # Skip for low memory or single CPU
+    if [ "$MEM_TIER" = "low" ] || [ "${CPU_CORES:-1}" -le 1 ]; then
+        note "Low memory or single CPU, skipping RPS/XPS"
+        return 0
+    fi
+
+    if [ -z "$iface" ] || [ ! -d "/sys/class/net/$iface/queues" ]; then
+        debug "Interface $iface not found or no queue support"
+        return 0
+    fi
+
+    # Check if NIC has enough hardware queues
+    local rx_queues=$(ls -d /sys/class/net/$iface/queues/rx-* 2>/dev/null | wc -l)
+    if [ "$rx_queues" -ge "$CPU_CORES" ]; then
+        note "NIC has sufficient queues ($rx_queues >= $CPU_CORES), RPS not needed"
+        return 0
+    fi
+
+    note "Configuring RPS/XPS for $iface ($rx_queues queues, $CPU_CORES CPUs)..."
+
+    # Generate CPU mask (max 8 cores)
+    local mask
+    if [ "$CPU_CORES" -le 4 ]; then
+        mask=$(printf '%x' $((2**CPU_CORES - 1)))
+    else
+        mask="ff"
+    fi
+
+    # Configure RPS for each RX queue
+    for rxq in /sys/class/net/$iface/queues/rx-*/rps_cpus; do
+        echo "$mask" > "$rxq" 2>/dev/null || true
+    done
+
+    # Configure RFS
+    local flow_entries=$((CPU_CORES * 4096))
+    echo "$flow_entries" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+
+    if [ "$rx_queues" -gt 0 ]; then
+        local flow_cnt=$((flow_entries / rx_queues))
+        for rxq in /sys/class/net/$iface/queues/rx-*/rps_flow_cnt; do
+            echo "$flow_cnt" > "$rxq" 2>/dev/null || true
+        done
+    fi
+
+    # Configure XPS for each TX queue
+    for txq in /sys/class/net/$iface/queues/tx-*/xps_cpus; do
+        echo "$mask" > "$txq" 2>/dev/null || true
+    done
+
+    RPS_CONFIGURED=1
+    ok "RPS/XPS configured (mask: $mask)"
+}
+
+configure_conntrack() {
+    if [ "$CONNTRACK_AVAILABLE" != "1" ]; then
+        return 0
+    fi
+
+    local conntrack_max
+    case "$MEM_TIER" in
+        low)    conntrack_max=131072 ;;
+        medium) conntrack_max=524288 ;;
+        high)   conntrack_max=1048576 ;;
+        *)      conntrack_max=524288 ;;
+    esac
+
+    note "Configuring conntrack (max: $conntrack_max)..."
+
+    echo "$conntrack_max" > /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || true
+    echo "86400" > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 2>/dev/null || true
+    echo "30" > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait 2>/dev/null || true
+
+    ok "Conntrack configured"
+}
+
 # --- Dynamic bucket functions ---
 bucket_le_mb() {
     local mb="${1:-0}"
@@ -503,33 +699,70 @@ bucket_le_mb() {
     fi
 }
 
-# Dynamic somaxconn based on memory
+# Dynamic somaxconn based on memory tier
 get_somaxconn() {
-    local mem_int=$(printf "%.0f" "$MEM_G")
-    if [ "$mem_int" -ge 8 ]; then echo 65535
-    elif [ "$mem_int" -ge 4 ]; then echo 32768
-    elif [ "$mem_int" -ge 2 ]; then echo 16384
-    else echo 8192
-    fi
+    case "$MEM_TIER" in
+        low)    echo 4096 ;;
+        medium) echo 32768 ;;
+        high)   echo 65535 ;;
+        *)      echo 32768 ;;
+    esac
 }
 
-# Dynamic netdev_max_backlog based on bandwidth (ESnet/Google recommended)
+# Dynamic netdev_max_backlog based on memory tier and bandwidth
 get_netdev_backlog() {
-    if [ "$BW_Mbps" -ge 10000 ]; then echo 250000
-    elif [ "$BW_Mbps" -ge 1000 ]; then echo 65535
-    elif [ "$BW_Mbps" -ge 100 ]; then echo 32768
-    else echo 10000
+    local base
+    if [ "$BW_Mbps" -ge 10000 ]; then
+        base=250000
+    elif [ "$BW_Mbps" -ge 1000 ]; then
+        base=65535
+    elif [ "$BW_Mbps" -ge 100 ]; then
+        base=32768
+    else
+        base=10000
     fi
+
+    # Adjust for low memory
+    case "$MEM_TIER" in
+        low)    echo $(( base / 5 )) ;;
+        *)      echo "$base" ;;
+    esac
 }
 
 # Dynamic UDP memory limits based on system memory (in pages, 1 page = 4KB)
 get_udp_mem() {
     local mem_bytes="$1"
     local total_pages=$(awk -v m="$mem_bytes" 'BEGIN{ printf "%.0f", m/4096 }')
-    local low=$(awk -v p="$total_pages" 'BEGIN{ printf "%.0f", p*0.03 }')
-    local pressure=$(awk -v p="$total_pages" 'BEGIN{ printf "%.0f", p*0.04 }')
-    local high=$(awk -v p="$total_pages" 'BEGIN{ printf "%.0f", p*0.06 }')
+    local low_pct pressure_pct high_pct
+
+    # Adjust percentages based on memory tier
+    case "$MEM_TIER" in
+        low)    low_pct=0.01; pressure_pct=0.02; high_pct=0.03 ;;
+        medium) low_pct=0.03; pressure_pct=0.04; high_pct=0.06 ;;
+        high)   low_pct=0.04; pressure_pct=0.05; high_pct=0.08 ;;
+        *)      low_pct=0.03; pressure_pct=0.04; high_pct=0.06 ;;
+    esac
+
+    local low=$(awk -v p="$total_pages" -v pct="$low_pct" 'BEGIN{ printf "%.0f", p*pct }')
+    local pressure=$(awk -v p="$total_pages" -v pct="$pressure_pct" 'BEGIN{ printf "%.0f", p*pct }')
+    local high=$(awk -v p="$total_pages" -v pct="$high_pct" 'BEGIN{ printf "%.0f", p*pct }')
     echo "$low $pressure $high"
+}
+
+# Dynamic tcp_max_tw_buckets based on memory tier
+get_max_tw_buckets() {
+    case "$MEM_TIER" in
+        low)    echo 32768 ;;
+        medium) echo 131072 ;;
+        high)
+            local mem_mb=$(awk -v m="$MEM_G" 'BEGIN{ printf "%.0f", m*1024 }')
+            local calc=$(( mem_mb * 10 ))
+            # Cap at 200000
+            [ "$calc" -gt 200000 ] && calc=200000
+            echo "$calc"
+            ;;
+        *)      echo 65535 ;;
+    esac
 }
 
 # --- Progress indicator ---
@@ -595,7 +828,11 @@ main() {
     if ! check_kernel; then
         HAS_BBR=0
     fi
-    
+
+    # Additional system detection
+    get_cpu_cores
+    check_conntrack_module
+
     # Handle uninstall
     if [ "$DO_UNINSTALL" = "1" ]; then
         do_uninstall
@@ -607,6 +844,9 @@ main() {
         MEM_G=$(get_mem_gib)
         debug "Auto-detected memory: ${MEM_G} GiB"
     fi
+
+    # Determine memory tier
+    get_mem_tier "$MEM_G"
     
     if [ -z "$RTT_ms" ]; then
         show_progress 2 5 "Testing network latency..."
@@ -683,13 +923,44 @@ main() {
     BDP_BYTES=$(awk -v bw="$BW_Mbps" -v rtt="$RTT_ms" 'BEGIN{ printf "%.0f", bw*125*rtt }')
     MEM_BYTES=$(get_mem_bytes "$MEM_G")
     TWO_BDP=$(( BDP_BYTES*2 ))
-    RAM3_BYTES=$(awk -v m="$MEM_BYTES" 'BEGIN{ printf "%.0f", m*0.03 }')
-    CAP64=$(( 64*1024*1024 ))
-    MAX_NUM_BYTES=$(awk -v a="$TWO_BDP" -v b="$RAM3_BYTES" -v c="$CAP64" 'BEGIN{ m=a; if(b<m)m=b; if(c<m)m=c; printf "%.0f", m }')
+
+    # RAM percentage and cap based on memory tier
+    local ram_pct cap_mb
+    case "$MEM_TIER" in
+        low)    ram_pct="0.02"; cap_mb=16 ;;
+        *)      ram_pct="0.03"; cap_mb=64 ;;
+    esac
+
+    RAM_PCT_BYTES=$(awk -v m="$MEM_BYTES" -v p="$ram_pct" 'BEGIN{ printf "%.0f", m*p }')
+    CAP_BYTES=$(( cap_mb*1024*1024 ))
+    MAX_NUM_BYTES=$(awk -v a="$TWO_BDP" -v b="$RAM_PCT_BYTES" -v c="$CAP_BYTES" 'BEGIN{ m=a; if(b<m)m=b; if(c<m)m=c; printf "%.0f", m }')
     
     MAX_MB_NUM=$(( MAX_NUM_BYTES/1024/1024 ))
     MAX_MB=$(bucket_le_mb "$MAX_MB_NUM")
     MAX_BYTES=$(( MAX_MB*1024*1024 ))
+
+    # Apply jitter adjustment (high jitter +20% buffer)
+    if [ -n "$RTT_JITTER" ] && [ -n "$RTT_ms" ]; then
+        if awk -v j="$RTT_JITTER" -v a="$RTT_ms" 'BEGIN { exit (j/a > 0.2) ? 0 : 1 }'; then
+            MAX_BYTES=$(awk -v m="$MAX_BYTES" 'BEGIN{ printf "%.0f", m*1.2 }')
+            note "High jitter detected (${RTT_JITTER}ms), buffer increased by 20%"
+        fi
+    fi
+
+    # Dynamic tcp_max_tw_buckets
+    MAX_TW_BUCKETS=$(get_max_tw_buckets)
+
+    # Dynamic tcp_retries2 based on packet loss
+    TCP_RETRIES2=8
+    if [ -n "$RTT_LOSS" ]; then
+        if [ "$RTT_LOSS" -gt 5 ]; then
+            TCP_RETRIES2=12
+            note "High packet loss (${RTT_LOSS}%), increasing tcp_retries2 to 12"
+        elif [ "$RTT_LOSS" -gt 1 ]; then
+            TCP_RETRIES2=10
+            note "Moderate packet loss (${RTT_LOSS}%), increasing tcp_retries2 to 10"
+        fi
+    fi
     
     debug "BDP: $BDP_BYTES bytes, Max buffer: $MAX_BYTES bytes"
     
@@ -727,8 +998,12 @@ main() {
     scan_conflicts_ro "/run/sysctl.d"
     
     # ---- Enable BBR module ----
-    if command -v modprobe >/dev/null 2>&1; then 
-        modprobe tcp_bbr 2>/dev/null || true
+    if command -v modprobe >/dev/null 2>&1; then
+        if [ "$HAS_BBR2" = "1" ]; then
+            modprobe tcp_bbr2 2>/dev/null || true
+        else
+            modprobe tcp_bbr 2>/dev/null || true
+        fi
     fi
     
     # ---- Write and apply ----
@@ -744,12 +1019,16 @@ main() {
 # =============================================================================
 # Inputs: MEM_G=${MEM_G}GiB, BW=${BW_Mbps}Mbps, RTT=${RTT_ms}ms
 # BDP: ${BDP_BYTES} bytes (~${BDP_MB_display} MB)
-# Caps: min(2*BDP, 3%RAM, 64MB) -> Bucket ${MAX_MB} MB
+# Memory Tier: ${MEM_TIER}
+# Caps: min(2*BDP, ${ram_pct}*RAM, ${cap_mb}MB) -> Bucket ${MAX_MB} MB
 
 # -----------------------------------------------------------------------------
 # Congestion Control & Queue Discipline
 # -----------------------------------------------------------------------------
-$(if [ "$HAS_BBR" = "1" ]; then
+$(if [ "$HAS_BBR2" = "1" ]; then
+    echo "net.core.default_qdisc = fq"
+    echo "net.ipv4.tcp_congestion_control = bbr2"
+elif [ "$HAS_BBR" = "1" ]; then
     echo "net.core.default_qdisc = fq"
     echo "net.ipv4.tcp_congestion_control = bbr"
 else
@@ -779,10 +1058,29 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_notsent_lowat = 131072
 net.ipv4.tcp_fastopen = 7
+net.ipv4.tcp_fastopen_connect = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
+
+# -----------------------------------------------------------------------------
+# TCP Retransmission & Connection Management (Proxy/VPN optimized)
+# -----------------------------------------------------------------------------
+net.ipv4.tcp_retries1 = 3
+net.ipv4.tcp_retries2 = ${TCP_RETRIES2}
+net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_abort_on_overflow = 1
+net.ipv4.tcp_max_tw_buckets = ${MAX_TW_BUCKETS}
+
+# -----------------------------------------------------------------------------
+# ECN & Thin Stream Optimization
+# -----------------------------------------------------------------------------
+net.ipv4.tcp_ecn = 1
+net.ipv4.tcp_ecn_fallback = 1
+net.ipv4.tcp_thin_linear_timeouts = 1
+net.ipv4.tcp_thin_dupack = 1
 
 # -----------------------------------------------------------------------------
 # Connection Queue & Softirq Budget
@@ -805,7 +1103,6 @@ net.ipv4.tcp_fin_timeout = 15
 # TCP Connection Reuse & Security
 # -----------------------------------------------------------------------------
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_max_tw_buckets = 65535
 net.ipv4.tcp_syncookies = 1
 
 # -----------------------------------------------------------------------------
@@ -815,6 +1112,14 @@ net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 net.ipv4.udp_mem = ${UDP_MEM}
+
+# -----------------------------------------------------------------------------
+# File Descriptor & VM Tuning
+# -----------------------------------------------------------------------------
+fs.file-max = $([ "$MEM_TIER" = "low" ] && echo "262144" || echo "2097152")
+vm.swappiness = $([ "$MEM_TIER" = "low" ] && echo "30" || echo "10")
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
 SYSCTL_EOF
 
     # Validate config file
@@ -836,6 +1141,11 @@ SYSCTL_EOF
     
     # Apply configuration
     apply_sysctl_settings
+
+    # Configure RPS/XPS and conntrack
+    IFACE="$(default_iface)"
+    configure_rps_xps "$IFACE"
+    configure_conntrack
     
     # Apply tc qdisc
     IFACE="$(default_iface)"
@@ -849,9 +1159,13 @@ SYSCTL_EOF
     fi
     
     # ---- Verify critical params ----
+    local expected_cc="bbr"
+    if [ "$HAS_BBR2" = "1" ]; then
+        expected_cc="bbr2"
+    fi
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    if [ "$current_cc" != "bbr" ]; then
-        warn "BBR not enabled (current: $current_cc), please check kernel support"
+    if [ "$current_cc" != "$expected_cc" ]; then
+        warn "Expected $expected_cc but got $current_cc, please check kernel support"
     fi
     
     # ---- Output results ----
@@ -863,9 +1177,18 @@ SYSCTL_EOF
     BDP_MB=$(awk -v b="$BDP_BYTES" 'BEGIN{ printf "%.2f", b/1024/1024 }')
     
     printf '%b[+] I. Input Parameters%b\n' "$GREEN" "$RESET"
-    printf "    - %-12s : %s\n" "Memory" "${MEM_G} GiB"
+    printf "    - %-12s : %s\n" "Memory" "${MEM_G} GiB (${MEM_TIER})"
     printf "    - %-12s : %s\n" "Bandwidth" "${BW_Mbps} Mbps"
     printf "    - %-12s : %s\n" "RTT" "${RTT_ms} ms"
+    if [ -n "$RTT_JITTER" ]; then
+        printf "    - %-12s : %s ms\n" "Jitter" "${RTT_JITTER}"
+    fi
+    if [ -n "$RTT_LOSS" ]; then
+        printf "    - %-12s : %s%%\n" "Packet Loss" "${RTT_LOSS}"
+    fi
+    if [ -n "$RTT_TARGET" ]; then
+        printf "    - %-12s : %s\n" "Ping Target" "${RTT_TARGET}"
+    fi
     printf "    - %-12s : %s\n" "BDP" "${BDP_MB} MB"
     printf "    - %-12s : %s\n" "Buffer Max" "${MAX_MB} MB"
     echo
@@ -899,6 +1222,15 @@ SYSCTL_EOF
         printf '%b[+] IV. Network Interface%b\n' "$GREEN" "$RESET"
         printf "    - Interface %-10s : %s\n" "${IFACE}" "$(tc qdisc show dev "$IFACE" 2>/dev/null | head -1 || echo "unknown")"
     fi
+
+    printf '%b[+] V. Proxy/VPN Optimizations%b\n' "$GREEN" "$RESET"
+    printf "    - %-25s : %s\n" "BBR Version" "$([ "$HAS_BBR2" = "1" ] && echo "BBRv2" || echo "BBRv1")"
+    printf "    - %-25s : %s\n" "Memory Profile" "$MEM_TIER"
+    printf "    - %-25s : %s\n" "RPS/XPS" "$([ "$RPS_CONFIGURED" = "1" ] && echo "Enabled" || echo "N/A")"
+    printf "    - %-25s : %s\n" "Conntrack" "$([ "$CONNTRACK_AVAILABLE" = "1" ] && echo "Enabled" || echo "N/A")"
+    printf "    - %-25s : %s\n" "tcp_retries2" "${TCP_RETRIES2}"
+    printf "    - %-25s : %s\n" "tcp_max_tw_buckets" "${MAX_TW_BUCKETS}"
+    printf "    - %-25s : %s\n" "fs.file-max" "$(sysctl -n fs.file-max 2>/dev/null || echo "unknown")"
     
     echo "=========================================="
     echo
